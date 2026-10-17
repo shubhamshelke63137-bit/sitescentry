@@ -1,0 +1,11 @@
+{
+  "name": "SiteSentry – AI Construction Site Safety Monitor",
+  "description": "AI-powered vision monitor detecting workers, hard hats, and safety vests with real-time hazard alerts and site mapping.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
