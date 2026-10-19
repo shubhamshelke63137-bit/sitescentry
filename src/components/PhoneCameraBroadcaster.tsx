@@ -31,9 +31,64 @@ export const PhoneCameraBroadcaster: React.FC<PhoneCameraBroadcasterProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [hasTorch, setHasTorch] = useState<boolean>(false);
   const [torchOn, setTorchOn] = useState<boolean>(false);
+  const [framesTransmitted, setFramesTransmitted] = useState<number>(0);
 
   const webRtcRef = useRef<SiteSentryWebRtc | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const relayIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isSendingFrameRef = useRef<boolean>(false);
+
+  // Continuous frame relay loop for guaranteed streaming even if P2P NAT fails
+  const startFrameRelayLoop = () => {
+    if (relayIntervalRef.current) clearInterval(relayIntervalRef.current);
+
+    const offscreen = document.createElement('canvas');
+    const offCtx = offscreen.getContext('2d');
+
+    relayIntervalRef.current = setInterval(async () => {
+      if (!videoRef.current || isSendingFrameRef.current) return;
+      const video = videoRef.current;
+      if (video.videoWidth === 0 || video.videoHeight === 0 || video.paused) return;
+
+      try {
+        isSendingFrameRef.current = true;
+        const targetWidth = 640;
+        const scale = targetWidth / video.videoWidth;
+        offscreen.width = targetWidth;
+        offscreen.height = Math.round(video.videoHeight * scale);
+
+        if (!offCtx) return;
+        offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+        const frameBase64 = offscreen.toDataURL('image/jpeg', 0.72);
+
+        const res = await fetch('/api/phone-stream/frame', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            frameBase64,
+            width: offscreen.width,
+            height: offscreen.height,
+          }),
+        });
+
+        if (res.ok) {
+          setFramesTransmitted((prev) => prev + 1);
+        }
+      } catch (err) {
+        // Suppress frame transmit network drops
+      } finally {
+        isSendingFrameRef.current = false;
+      }
+    }, 220); // ~4.5 FPS live stream relay
+  };
+
+  const stopFrameRelayLoop = () => {
+    if (relayIntervalRef.current) {
+      clearInterval(relayIntervalRef.current);
+      relayIntervalRef.current = null;
+    }
+  };
 
   // Start broadcasting camera to laptop
   const startBroadcast = async (preferredFacing: 'environment' | 'user' = facingMode) => {
@@ -68,29 +123,32 @@ export const PhoneCameraBroadcaster: React.FC<PhoneCameraBroadcasterProps> = ({
         setHasTorch(true);
       }
 
-      setConnectionStatus('Connecting to Laptop Dashboard...');
+      setConnectionStatus('Streaming Live to Laptop...');
+      setIsStreaming(true);
 
-      // Initialize WebRTC
+      // Start continuous frame relay immediately
+      startFrameRelayLoop();
+
+      // Also initialize WebRTC P2P in parallel
       webRtcRef.current = new SiteSentryWebRtc(sessionId, 'phone', {
         onConnectionStateChange: (state) => {
           if (state === 'connected') {
             setIsP2pConnected(true);
-            setConnectionStatus('Broadcasting Live to Laptop (P2P Active)');
+            setConnectionStatus('Broadcasting Live to Laptop (P2P + Relay Active)');
           } else if (state === 'disconnected' || state === 'failed') {
             setIsP2pConnected(false);
-            setConnectionStatus('Reconnecting to Laptop...');
+            setConnectionStatus('Streaming via High-Speed Cloud Relay...');
           }
         },
         onPeerJoined: () => {
           setConnectionStatus('Laptop Dashboard Connected! Streaming Video...');
         },
         onError: (err) => {
-          setErrorMessage(err);
+          console.warn('WebRTC signaling notice:', err);
         },
       });
 
       await webRtcRef.current.init(stream);
-      setIsStreaming(true);
     } catch (err: any) {
       console.error('Camera broadcast error:', err);
       let msg = 'Failed to access camera.';
@@ -109,6 +167,7 @@ export const PhoneCameraBroadcaster: React.FC<PhoneCameraBroadcasterProps> = ({
 
   // Stop broadcasting & release all hardware tracks
   const stopBroadcast = () => {
+    stopFrameRelayLoop();
     if (webRtcRef.current) {
       webRtcRef.current.disconnect();
       webRtcRef.current = null;
@@ -149,8 +208,9 @@ export const PhoneCameraBroadcaster: React.FC<PhoneCameraBroadcasterProps> = ({
     }
   };
 
-  // Clean up on unmount
+  // Auto-start camera when phone opens page
   useEffect(() => {
+    startBroadcast(facingMode);
     return () => {
       stopBroadcast();
     };

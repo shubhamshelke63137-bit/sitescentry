@@ -69,7 +69,23 @@ setInterval(() => {
       rooms.delete(id);
     }
   }
-}, 600000);
+  for (const [id, frame] of latestPhoneFrames.entries()) {
+    if (Date.now() - frame.timestamp > 300000) {
+      latestPhoneFrames.delete(id);
+    }
+  }
+}, 60000);
+
+// In-Memory Live Frame Relay for Phone-to-Laptop guaranteed streaming
+interface PhoneFrameData {
+  sessionId: string;
+  frameBase64: string;
+  timestamp: number;
+  width?: number;
+  height?: number;
+}
+const latestPhoneFrames = new Map<string, PhoneFrameData>();
+const sseListeners = new Map<string, Set<express.Response>>();
 
 async function startServer() {
   const app = express();
@@ -170,7 +186,112 @@ async function startServer() {
     if (role === 'laptop') room.laptopConnected = true;
     if (role === 'phone') room.phoneConnected = true;
     room.lastUpdated = Date.now();
-    res.json({ success: true, room: { ...room } });
+    res.json({
+      success: true,
+      room: { ...room },
+      peerAlreadyPresent: role === 'phone' ? room.laptopConnected : room.phoneConnected,
+    });
+  });
+
+  // Dedicated Live Phone Video Frame Relay (Guarantees phone-to-laptop feed works on any network)
+  app.post('/api/phone-stream/frame', (req, res) => {
+    const { sessionId, frameBase64, width, height } = req.body;
+    if (!sessionId || !frameBase64) {
+      return res.status(400).json({ error: 'Missing sessionId or frameBase64' });
+    }
+
+    const room = getOrCreateRoom(sessionId);
+    room.phoneConnected = true;
+    room.lastUpdated = Date.now();
+
+    const frameData: PhoneFrameData = {
+      sessionId,
+      frameBase64,
+      timestamp: Date.now(),
+      width,
+      height,
+    };
+    latestPhoneFrames.set(sessionId, frameData);
+
+    // Broadcast to SSE clients if any
+    const listeners = sseListeners.get(sessionId);
+    if (listeners && listeners.size > 0) {
+      const payload = `data: ${JSON.stringify({ frameBase64, timestamp: frameData.timestamp, width, height })}\n\n`;
+      for (const clientRes of listeners) {
+        try {
+          clientRes.write(payload);
+        } catch {
+          listeners.delete(clientRes);
+        }
+      }
+    }
+
+    res.json({ success: true, timestamp: frameData.timestamp });
+  });
+
+  app.get('/api/phone-stream/latest', (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    const frame = latestPhoneFrames.get(sessionId);
+    const room = rooms.get(sessionId);
+    const isRecent = frame ? Date.now() - frame.timestamp < 10000 : false;
+    res.json({
+      frame: frame ? frame.frameBase64 : null,
+      timestamp: frame ? frame.timestamp : null,
+      width: frame?.width,
+      height: frame?.height,
+      isPhoneConnected: Boolean(room?.phoneConnected && isRecent),
+    });
+  });
+
+  app.get('/api/phone-stream/events', (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) return res.status(400).send('Missing sessionId');
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders?.();
+
+    let listeners = sseListeners.get(sessionId);
+    if (!listeners) {
+      listeners = new Set();
+      sseListeners.set(sessionId, listeners);
+    }
+    listeners.add(res);
+
+    const existing = latestPhoneFrames.get(sessionId);
+    if (existing) {
+      res.write(`data: ${JSON.stringify({ frameBase64: existing.frameBase64, timestamp: existing.timestamp })}\n\n`);
+    }
+
+    const ping = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(ping);
+      }
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(ping);
+      listeners?.delete(res);
+    });
+  });
+
+  app.get('/api/phone-stream/status', (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    const room = rooms.get(sessionId);
+    const frame = latestPhoneFrames.get(sessionId);
+    const isRecent = frame ? Date.now() - frame.timestamp < 9000 : false;
+    res.json({
+      phoneConnected: Boolean(room?.phoneConnected || isRecent),
+      laptopConnected: Boolean(room?.laptopConnected),
+      hasFrame: Boolean(frame),
+      lastFrameAgeMs: frame ? Date.now() - frame.timestamp : null,
+    });
   });
 
   app.post('/api/webrtc/offer', (req, res) => {

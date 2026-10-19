@@ -34,6 +34,8 @@ import { notificationService } from '../utils/notificationService';
 
 interface LiveMonitorViewProps {
   remotePhoneStream: MediaStream | null;
+  latestPhoneFrame?: string | null;
+  phoneStreamSourceType?: 'webrtc' | 'relay' | 'none';
   isPhoneConnected: boolean;
   engineMode: ModelEngineMode;
   currentZone: string;
@@ -49,6 +51,8 @@ interface LiveMonitorViewProps {
 
 export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
   remotePhoneStream,
+  latestPhoneFrame,
+  phoneStreamSourceType = 'none',
   isPhoneConnected,
   engineMode,
   currentZone,
@@ -62,6 +66,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
   onToggleDetection,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const phoneImgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -73,7 +78,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
 
   const [isMonitoring, setIsMonitoring] = useState<boolean>(true);
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
-  const [autoScanInterval, setAutoScanInterval] = useState<number>(8); // default to 8s to conserve quota
+  const [autoScanInterval, setAutoScanInterval] = useState<number>(6); // 6s interval for responsive safety detection
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [localWebcamStream, setLocalWebcamStream] = useState<MediaStream | null>(null);
   const [lastLatency, setLastLatency] = useState<number | null>(null);
@@ -83,20 +88,22 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
   const [isQuotaExceeded, setIsQuotaExceeded] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
+  const [isRemoteVideoPlaying, setIsRemoteVideoPlaying] = useState<boolean>(false);
   const [desktopNotifGranted, setDesktopNotifGranted] = useState<boolean>(() => {
     return typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted';
   });
 
-  // Switch to phone stream if phone becomes connected
+  // Switch to phone stream whenever phone connects or frames arrive
   useEffect(() => {
-    if (isPhoneConnected && remotePhoneStream) {
+    if (isPhoneConnected || latestPhoneFrame || remotePhoneStream) {
       setSourceType('phone_webrtc');
-      if (videoRef.current) {
+      if (videoRef.current && remotePhoneStream) {
         videoRef.current.srcObject = remotePhoneStream;
-        videoRef.current.play().catch((e) => console.warn(e));
+        videoRef.current.play().catch((e) => console.warn('Phone video play warning:', e));
       }
     }
-  }, [isPhoneConnected, remotePhoneStream]);
+  }, [isPhoneConnected, remotePhoneStream, latestPhoneFrame]);
+
 
   // Handle stream source changes
   useEffect(() => {
@@ -379,29 +386,49 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
 
   // Capture frame and send to AI Object Detection API
   const captureAndAnalyze = useCallback(async () => {
-    if (!videoRef.current || isAnalyzing || !isMonitoring) return;
+    if (isAnalyzing || !isMonitoring) return;
+
+    let snapshotUrl: string = '';
+    let captureWidth = 640;
+    let captureHeight = 480;
+
     const video = videoRef.current;
-    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+    const isUsingVideoTrack = Boolean(
+      video && video.videoWidth > 0 && video.videoHeight > 0 && !video.paused
+    );
+
+    // If source is phone stream and we have relayed JPEG frames, use them directly
+    if (sourceType === 'phone_webrtc' && latestPhoneFrame && !isUsingVideoTrack) {
+      snapshotUrl = latestPhoneFrame;
+      captureWidth = phoneImgRef.current?.naturalWidth || 640;
+      captureHeight = phoneImgRef.current?.naturalHeight || 480;
+    } else if (isUsingVideoTrack && video) {
+      const offscreen = document.createElement('canvas');
+      const targetWidth = 640;
+      const scale = targetWidth / video.videoWidth;
+      offscreen.width = targetWidth;
+      offscreen.height = Math.round(video.videoHeight * scale);
+
+      const offCtx = offscreen.getContext('2d');
+      if (!offCtx) return;
+
+      offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+      snapshotUrl = offscreen.toDataURL('image/jpeg', 0.85);
+      captureWidth = video.videoWidth;
+      captureHeight = video.videoHeight;
+    } else if (latestPhoneFrame) {
+      snapshotUrl = latestPhoneFrame;
+      captureWidth = phoneImgRef.current?.naturalWidth || 640;
+      captureHeight = phoneImgRef.current?.naturalHeight || 480;
+    } else {
+      // No active video track or frame yet
+      return;
+    }
 
     setIsAnalyzing(true);
     const startTime = Date.now();
 
     try {
-      const offscreen = document.createElement('canvas');
-      const targetWidth = 640;
-      const scale = targetWidth / video.videoWidth;
-      offscreen.width = targetWidth;
-      offscreen.height = video.videoHeight * scale;
-
-      const offCtx = offscreen.getContext('2d');
-      if (!offCtx) {
-        setIsAnalyzing(false);
-        return;
-      }
-
-      offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
-      const snapshotUrl = offscreen.toDataURL('image/jpeg', 0.85);
-
       if (engineMode === 'REAL_GEMINI') {
         const response = await fetch('/api/analyze-frame', {
           method: 'POST',
@@ -450,7 +477,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
           setCurrentDetections(detectedPersons);
           setOverallHazard(hazard);
 
-          drawBoundingBoxes(detectedPersons, video.videoWidth, video.videoHeight, inspectionMode);
+          drawBoundingBoxes(detectedPersons, captureWidth, captureHeight, inspectionMode);
 
           const isQuota = Boolean(resData.isQuotaExceeded);
           if (isQuota) {
@@ -550,7 +577,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
 
         setCurrentDetections(simulated);
         setOverallHazard('LOW');
-        drawBoundingBoxes(simulated, video.videoWidth, video.videoHeight, inspectionMode);
+        drawBoundingBoxes(simulated, captureWidth, captureHeight, inspectionMode);
 
         onDetectionUpdate(
           {
@@ -577,6 +604,8 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
     currentZone,
     confidenceThreshold,
     inspectionMode,
+    latestPhoneFrame,
+    sourceType,
     drawBoundingBoxes,
     onDetectionUpdate,
     onTriggerAlert,
@@ -596,6 +625,18 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
       if (timer) clearInterval(timer);
     };
   }, [isMonitoring, isDetectionRunning, autoScanInterval, isAnalyzing, captureAndAnalyze]);
+
+  // Trigger immediate AI detection when phone first pairs and sends frames
+  const initialScanTriggeredRef = useRef<boolean>(false);
+  useEffect(() => {
+    if ((isPhoneConnected || latestPhoneFrame) && !initialScanTriggeredRef.current) {
+      initialScanTriggeredRef.current = true;
+      const timer = setTimeout(() => {
+        captureAndAnalyze();
+      }, 750);
+      return () => clearTimeout(timer);
+    }
+  }, [isPhoneConnected, latestPhoneFrame, captureAndAnalyze]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -718,7 +759,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
         </div>
       </div>
 
-      {/* Stream Source Selector */}
+      {/* Stream Source Selector & Manual Detection Controls */}
       <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-3 rounded-2xl">
         <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs font-semibold">
           <button
@@ -730,9 +771,9 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
             }`}
           >
             <Smartphone className="w-3.5 h-3.5" />
-            <span>Phone WebRTC Stream</span>
+            <span>Phone Camera</span>
             {isPhoneConnected && (
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse ml-1" />
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse ml-0.5" />
             )}
           </button>
 
@@ -761,21 +802,31 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
           </label>
         </div>
 
-        {/* Latency and Zone */}
+        {/* Action Controls: 1-Click Detect Now + Latency & Fullscreen */}
         <div className="flex items-center space-x-2 text-xs">
-          <span className="px-2.5 py-1 rounded-lg bg-slate-950 text-slate-300 border border-slate-800 font-mono">
+          <button
+            onClick={() => captureAndAnalyze()}
+            disabled={isAnalyzing || !isMonitoring}
+            className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 text-slate-950 font-extrabold flex items-center gap-1.5 shadow-md shadow-amber-500/20 cursor-pointer transition-all disabled:opacity-50"
+            title="Scan current frame for helmets, vests, and worker violations"
+          >
+            <Scan className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : 'animate-pulse'}`} />
+            <span>{isAnalyzing ? 'Analyzing...' : 'Run Detection Now'}</span>
+          </button>
+
+          <span className="px-2.5 py-1.5 rounded-lg bg-slate-950 text-slate-300 border border-slate-800 font-mono hidden sm:inline">
             {currentZone}
           </span>
 
           {lastLatency && (
-            <span className="px-2 py-1 rounded-lg bg-slate-950 text-slate-400 border border-slate-800 font-mono">
-              {lastLatency}ms latency
+            <span className="px-2 py-1.5 rounded-lg bg-slate-950 text-slate-400 border border-slate-800 font-mono hidden md:inline">
+              {lastLatency}ms
             </span>
           )}
 
           <button
             onClick={toggleFullscreen}
-            className="p-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800"
+            className="p-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 cursor-pointer"
             title="Fullscreen"
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -789,14 +840,38 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
         className="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl relative flex flex-col"
       >
         <div className="relative bg-black aspect-video sm:min-h-[460px] flex items-center justify-center overflow-hidden">
+          {/* Video element for Laptop Webcam or WebRTC */}
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
-            className={`w-full h-full object-contain ${isMonitoring ? 'block' : 'hidden'}`}
+            onPlaying={() => {
+              if (sourceType === 'phone_webrtc') setIsRemoteVideoPlaying(true);
+            }}
+            onLoadedMetadata={(e) => {
+              if (sourceType === 'phone_webrtc' && e.currentTarget.videoWidth > 0) {
+                setIsRemoteVideoPlaying(true);
+              }
+            }}
+            className={`w-full h-full object-contain ${
+              isMonitoring && (sourceType !== 'phone_webrtc' || isRemoteVideoPlaying || !latestPhoneFrame)
+                ? 'block'
+                : 'hidden'
+            }`}
           />
 
+          {/* Direct Live Frame Relay for Phone Camera (Guaranteed 100% display without NAT issues) */}
+          {sourceType === 'phone_webrtc' && latestPhoneFrame && !isRemoteVideoPlaying && (
+            <img
+              ref={phoneImgRef}
+              src={latestPhoneFrame}
+              alt="Live Phone Camera Feed"
+              className={`w-full h-full object-contain ${isMonitoring ? 'block' : 'hidden'}`}
+            />
+          )}
+
+          {/* AI Bounding Boxes Overlay Canvas */}
           <canvas
             ref={canvasRef}
             className={`absolute inset-0 w-full h-full pointer-events-none object-contain ${
@@ -804,11 +879,50 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
             }`}
           />
 
+          {/* Live Stream HUD Overlay */}
+          {isMonitoring && (
+            <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none">
+              <div className="flex items-center space-x-2">
+                <div className="px-2.5 py-1 rounded-xl bg-slate-950/80 backdrop-blur-md border border-slate-800 text-[11px] font-mono flex items-center gap-1.5 text-white">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      sourceType === 'phone_webrtc' && isPhoneConnected
+                        ? 'bg-emerald-400 animate-pulse'
+                        : 'bg-amber-400'
+                    }`}
+                  />
+                  <span>
+                    {sourceType === 'phone_webrtc'
+                      ? isPhoneConnected
+                        ? '📱 Phone Camera Live Feed'
+                        : '📱 Phone Camera (Waiting)'
+                      : '💻 Laptop Webcam'}
+                  </span>
+                </div>
+
+                <div className="px-2.5 py-1 rounded-xl bg-slate-950/80 backdrop-blur-md border border-slate-800 text-[11px] font-bold text-amber-300">
+                  {inspectionMode === 'HELMET_ONLY'
+                    ? '🎯 Helmet Mode'
+                    : inspectionMode === 'VEST_ONLY'
+                    ? '🎯 Safety Jacket Mode'
+                    : '🎯 Full PPE Mode'}
+                </div>
+              </div>
+
+              {/* Scanning indicator */}
+              {isAnalyzing && (
+                <div className="px-2.5 py-1 rounded-xl bg-amber-500/90 text-slate-950 text-[11px] font-black animate-pulse shadow-md">
+                  Scanning AI Vision...
+                </div>
+              )}
+            </div>
+          )}
+
           {isAnalyzing && (
             <div className="absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-amber-400 to-transparent animate-bounce opacity-85 shadow-lg shadow-amber-500 pointer-events-none" />
           )}
 
-          {sourceType === 'phone_webrtc' && !isPhoneConnected && (
+          {sourceType === 'phone_webrtc' && !isPhoneConnected && !latestPhoneFrame && (
             <div className="p-8 text-center max-w-md space-y-4">
               <div className="w-16 h-16 mx-auto rounded-3xl bg-slate-800 border border-slate-700 flex items-center justify-center text-amber-400 shadow-xl">
                 <Smartphone className="w-8 h-8" />
@@ -828,7 +942,7 @@ export const LiveMonitorView: React.FC<LiveMonitorViewProps> = ({
                 </button>
                 <button
                   onClick={() => setSourceType('laptop_webcam')}
-                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs"
+                  className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs cursor-pointer"
                 >
                   Use Laptop Webcam
                 </button>

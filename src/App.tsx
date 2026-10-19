@@ -180,8 +180,10 @@ export default function App() {
     inspectionMode: 'FULL_PPE',
   });
 
-  // WebRTC Laptop Receiver State
+  // WebRTC Laptop Receiver & Live Frame Relay State
   const [remotePhoneStream, setRemotePhoneStream] = useState<MediaStream | null>(null);
+  const [latestPhoneFrame, setLatestPhoneFrame] = useState<string | null>(null);
+  const [phoneStreamSourceType, setPhoneStreamSourceType] = useState<'webrtc' | 'relay' | 'none'>('none');
   const [isPhoneConnected, setIsPhoneConnected] = useState<boolean>(false);
   const [webrtcState, setWebrtcState] = useState<RTCPeerConnectionState>('new');
   const [signalingLogs, setSignalingLogs] = useState<string[]>([]);
@@ -249,6 +251,56 @@ export default function App() {
     setSignalingLogs((prev) => [`[${time}] ${msg}`, ...prev.slice(0, 20)]);
   };
 
+  // Continuous listener for live phone stream relay frames via SSE + HTTP Polling
+  useEffect(() => {
+    if (isPhoneBroadcasterMode) return;
+
+    let eventSource: EventSource | null = null;
+    let pollTimer: NodeJS.Timeout | null = null;
+    let lastFrameTime = 0;
+
+    try {
+      eventSource = new EventSource(`/api/phone-stream/events?sessionId=${encodeURIComponent(sessionId)}`);
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.frameBase64) {
+            setLatestPhoneFrame(data.frameBase64);
+            setIsPhoneConnected(true);
+            setPhoneStreamSourceType((prev) => (prev === 'webrtc' ? 'webrtc' : 'relay'));
+            lastFrameTime = Date.now();
+          }
+        } catch {}
+      };
+      eventSource.onerror = () => {
+        // SSE transient error, polling backup handles
+      };
+    } catch {}
+
+    // Polling backup to guarantee frames arrive regardless of network/proxy
+    pollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/phone-stream/latest?sessionId=${encodeURIComponent(sessionId)}`);
+        const data = await res.json();
+        if (data.frame) {
+          setLatestPhoneFrame(data.frame);
+          setIsPhoneConnected(true);
+          setPhoneStreamSourceType((prev) => (prev === 'webrtc' ? 'webrtc' : 'relay'));
+          lastFrameTime = Date.now();
+        } else if (Date.now() - lastFrameTime > 12000 && !remotePhoneStream) {
+          // If no frame and no WebRTC track for 12 seconds, update status
+          setIsPhoneConnected(false);
+          setPhoneStreamSourceType('none');
+        }
+      } catch {}
+    }, 1200);
+
+    return () => {
+      if (eventSource) eventSource.close();
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [sessionId, isPhoneBroadcasterMode, remotePhoneStream]);
+
   // Initialize WebRTC on Laptop Dashboard to receive stream from paired phone
   useEffect(() => {
     if (isPhoneBroadcasterMode) return;
@@ -260,14 +312,16 @@ export default function App() {
         addSignalingLog('Remote camera video track received from mobile phone!');
         setRemotePhoneStream(stream);
         setIsPhoneConnected(true);
+        setPhoneStreamSourceType('webrtc');
       },
       onConnectionStateChange: (state) => {
         setWebrtcState(state);
         addSignalingLog(`P2P Connection State: ${state}`);
         if (state === 'connected') {
           setIsPhoneConnected(true);
+          setPhoneStreamSourceType('webrtc');
         } else if (state === 'disconnected' || state === 'failed') {
-          setIsPhoneConnected(false);
+          // Keep relay active if frames are coming
           setRemotePhoneStream(null);
         }
       },
@@ -276,7 +330,9 @@ export default function App() {
       },
       onPeerLeft: () => {
         addSignalingLog('Mobile phone disconnected.');
-        setIsPhoneConnected(false);
+        if (!latestPhoneFrame) {
+          setIsPhoneConnected(false);
+        }
         setRemotePhoneStream(null);
       },
       onError: (err) => {
@@ -290,7 +346,7 @@ export default function App() {
       laptopRtcRef.current?.disconnect();
       laptopRtcRef.current = null;
     };
-  }, [sessionId, isPhoneBroadcasterMode]);
+  }, [sessionId, isPhoneBroadcasterMode, latestPhoneFrame]);
 
   // Handle Detection Updates
   const handleDetectionUpdate = useCallback(
@@ -379,6 +435,8 @@ export default function App() {
   const handleDisconnectPhone = () => {
     laptopRtcRef.current?.disconnect();
     setRemotePhoneStream(null);
+    setLatestPhoneFrame(null);
+    setPhoneStreamSourceType('none');
     setIsPhoneConnected(false);
     handleGenerateNewSession();
   };
@@ -567,6 +625,8 @@ export default function App() {
 
                   <LiveMonitorView
                     remotePhoneStream={remotePhoneStream}
+                    latestPhoneFrame={latestPhoneFrame}
+                    phoneStreamSourceType={phoneStreamSourceType}
                     isPhoneConnected={isPhoneConnected}
                     engineMode={engineMode}
                     currentZone={currentZone}
@@ -652,6 +712,8 @@ export default function App() {
 
               <LiveMonitorView
                 remotePhoneStream={remotePhoneStream}
+                latestPhoneFrame={latestPhoneFrame}
+                phoneStreamSourceType={phoneStreamSourceType}
                 isPhoneConnected={isPhoneConnected}
                 engineMode={engineMode}
                 currentZone={currentZone}

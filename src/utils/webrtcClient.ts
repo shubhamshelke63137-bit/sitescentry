@@ -14,6 +14,10 @@ const ICE_SERVERS: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.services.mozilla.com:3478' },
   ],
 };
 
@@ -221,7 +225,17 @@ export class SiteSentryWebRtc {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId: this.sessionId, role: this.role }),
-    }).catch((e) => console.warn(e));
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.peerAlreadyPresent) {
+          this.callbacks.onPeerJoined?.();
+          if (this.role === 'phone' && this.peerConnection?.signalingState === 'stable') {
+            this.createAndSendOffer();
+          }
+        }
+      })
+      .catch((e) => console.warn(e));
 
     this.pollInterval = setInterval(async () => {
       if (this.isCleanedUp || !this.peerConnection) return;
@@ -234,12 +248,21 @@ export class SiteSentryWebRtc {
           if (data.offer && !this.peerConnection.currentRemoteDescription) {
             await this.handleSignalingMessage({ type: 'offer', data: data.offer });
           }
-        } else if (this.role === 'phone' && this.peerConnection.signalingState === 'have-local-offer') {
-          // Poll for answer from laptop
-          const res = await fetch(`/api/webrtc/answer?sessionId=${encodeURIComponent(this.sessionId)}`);
-          const data = await res.json();
-          if (data.answer && !this.peerConnection.currentRemoteDescription) {
-            await this.handleSignalingMessage({ type: 'answer', data: data.answer });
+        } else if (this.role === 'phone') {
+          if (this.peerConnection.signalingState === 'stable') {
+            // Check if laptop has joined and we haven't offered yet
+            const sRes = await fetch(`/api/phone-stream/status?sessionId=${encodeURIComponent(this.sessionId)}`);
+            const sData = await sRes.json();
+            if (sData.laptopConnected && !this.peerConnection.currentRemoteDescription) {
+              await this.createAndSendOffer();
+            }
+          } else if (this.peerConnection.signalingState === 'have-local-offer') {
+            // Poll for answer from laptop
+            const res = await fetch(`/api/webrtc/answer?sessionId=${encodeURIComponent(this.sessionId)}`);
+            const data = await res.json();
+            if (data.answer && !this.peerConnection.currentRemoteDescription) {
+              await this.handleSignalingMessage({ type: 'answer', data: data.answer });
+            }
           }
         }
 
@@ -253,7 +276,7 @@ export class SiteSentryWebRtc {
             await this.handleSignalingMessage({ type: 'candidate', data: cand });
           }
         }
-      } catch (e) {
+      } catch {
         // Suppress polling network error logs
       }
     }, 1200);
